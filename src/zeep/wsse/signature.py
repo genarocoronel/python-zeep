@@ -32,13 +32,18 @@ def _read_file(f_name):
 
 
 def _make_sign_key(key_data, cert_data, password):
-    key = xmlsec.Key.from_memory(key_data, xmlsec.KeyFormat.PEM, password)
-    key.load_cert_from_memory(cert_data, xmlsec.KeyFormat.PEM)
+    # keys can be ['BINARY', 'CERT_DER', 'CERT_PEM', 'DER', 'PEM' (2), 'PKCS12_PEM' (6), 'PKCS8_DER', 'PKCS8_PEM', 'UNKNOWN']
+    try:
+        key = xmlsec.Key.from_memory(key_data, 2, password)
+    except xmlsec.Error:
+        key = xmlsec.Key.from_memory(key_data, 6, password)
+    key.load_cert_from_memory(cert_data, 2)
     return key
 
 
 def _make_verify_key(cert_data):
-    key = xmlsec.Key.from_memory(cert_data, xmlsec.KeyFormat.CERT_PEM, None)
+    # 2 is the key format for PEM
+    key = xmlsec.Key.from_memory(cert_data, 2, None)
     return key
 
 
@@ -220,12 +225,20 @@ def _signature_prepare(envelope, key, signature_method, digest_method):
     """Prepare envelope and sign."""
     soap_env = detect_soap_env(envelope)
 
-    # Create the Signature node.
-    signature = xmlsec.template.create(
-        envelope,
-        xmlsec.Transform.EXCL_C14N,
-        signature_method or xmlsec.Transform.RSA_SHA1,
-    )
+    security = get_security_header(envelope)
+    sst_qname = QName(ns.DS, "Signature")
+    # Create the Signature node if it doesn't already exist.
+    signature = security.find(sst_qname)
+    if signature is None:
+    #    signature.getparent().remove(signature)
+    #if True:
+        signature = xmlsec.template.create(
+            envelope,
+            xmlsec.Transform.EXCL_C14N,
+            signature_method or xmlsec.Transform.RSA_SHA1,
+        )
+        # Insert the Signature node in the wsse:Security header.
+        security.insert(0, signature)
 
     # Add a KeyInfo node with X509Data child to the Signature. XMLSec will fill
     # in this template with the actual certificate details when it signs.
@@ -234,17 +247,27 @@ def _signature_prepare(envelope, key, signature_method, digest_method):
     xmlsec.template.x509_data_add_issuer_serial(x509_data)
     xmlsec.template.x509_data_add_certificate(x509_data)
 
-    # Insert the Signature node in the wsse:Security header.
     security = get_security_header(envelope)
-    security.insert(0, signature)
 
     # Perform the actual signing.
     ctx = xmlsec.SignatureContext()
     ctx.key = key
     _sign_node(ctx, signature, envelope.find(QName(soap_env, "Body")), digest_method)
+
+    # Sign UserToken
+    #unt = security.find(QName(ns.WSSE, "UsernameToken"))
+    #if unt is not None:
+    #    _sign_node(ctx, signature, unt, digest_method)
+
     timestamp = security.find(QName(ns.WSU, "Timestamp"))
-    if timestamp != None:
+    if timestamp is not None:
         _sign_node(ctx, signature, timestamp, digest_method)
+
+    # Sign WSA elements.
+    #soap_header = envelope.find(QName(soap_env, "Header"))
+    #for wsa_elem in ["To", "MessageID", "Action"]:
+    #    _sign_node(ctx, signature, soap_header.find(QName(ns.WSA, wsa_elem)), digest_method)
+
     ctx.sign(signature)
 
     # Place the X509 data inside a WSSE SecurityTokenReference within
@@ -274,18 +297,23 @@ def _sign_envelope_with_key_binary(envelope, key, signature_method, digest_metho
             "oasis-200401-wss-x509-token-profile-1.0#X509v3"
         },
     )
-    bintok = etree.Element(
-        QName(ns.WSSE, "BinarySecurityToken"),
-        {
-            "ValueType": "http://docs.oasis-open.org/wss/2004/01/"
-            "oasis-200401-wss-x509-token-profile-1.0#X509v3",
-            "EncodingType": "http://docs.oasis-open.org/wss/2004/01/"
-            "oasis-200401-wss-soap-message-security-1.0#Base64Binary",
-        },
-    )
+    bst_qname = QName(ns.WSSE, "BinarySecurityToken")
+    bintok = security.find(bst_qname)
+    if bintok is None:
+        bintok = etree.Element(
+            QName(ns.WSSE, "BinarySecurityToken"),
+            {
+                "ValueType": "http://docs.oasis-open.org/wss/2004/01/"
+                "oasis-200401-wss-x509-token-profile-1.0#X509v3",
+                "EncodingType": "http://docs.oasis-open.org/wss/2004/01/"
+                "oasis-200401-wss-soap-message-security-1.0#Base64Binary",
+            },
+        )
+        security.insert(1, bintok)
     ref.attrib["URI"] = "#" + ensure_id(bintok)
-    bintok.text = x509_data.find(QName(ns.DS, "X509Certificate")).text
-    security.insert(1, bintok)
+    x509certificate_node = x509_data.find(QName(ns.DS, "X509Certificate"))
+    if x509certificate_node is not None:
+        bintok.text = x509certificate_node.text
     x509_data.getparent().remove(x509_data)
 
 
@@ -356,11 +384,17 @@ def _sign_node(ctx, signature, target, digest_method=None):
     ctx.register_id(target, "Id", ns.WSU)
 
     # Add reference to signature with URI attribute pointing to that ID.
-    ref = xmlsec.template.add_reference(
-        signature, digest_method or xmlsec.Transform.SHA1, uri="#" + node_id
-    )
-    # This is an XML normalization transform which will be performed on the
-    # target node contents before signing. This ensures that changes to
-    # irrelevant whitespace, attribute ordering, etc won't invalidate the
-    # signature.
-    xmlsec.template.add_transform(ref, xmlsec.Transform.EXCL_C14N)
+    uri = "#" + node_id
+    sap = f'.//*[local-name()="Reference" and @URI="{uri}"]'
+    sip = signature.xpath(sap)
+    if len(sip) > 0:
+        ref = sip[0]
+    else:
+        ref = xmlsec.template.add_reference(
+            signature, digest_method or xmlsec.Transform.SHA1, uri="#" + node_id
+        )
+        # This is an XML normalization transform which will be performed on the
+        # target node contents before signing. This ensures that changes to
+        # irrelevant whitespace, attribute ordering, etc won't invalidate the
+        # signature.
+        xmlsec.template.add_transform(ref, xmlsec.Transform.EXCL_C14N)
