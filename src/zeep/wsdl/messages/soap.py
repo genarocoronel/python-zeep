@@ -117,7 +117,7 @@ class SoapMessage(ConcreteMessage):
 
         result = result.body
         if not hasattr(result, '__len__'): # Return body directly if len is allowed (could indicated valid primitive type).
-            return result        
+            return result
         if result is None or len(result) == 0:
             return None
         elif len(result) > 1:
